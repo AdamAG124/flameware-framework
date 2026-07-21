@@ -1,0 +1,26 @@
+# Dependencias
+/vendor/
+
+# Artefactos generados
+/Storage/route-cache.php
+/Storage/logs/*
+!/Storage/logs/.gitkeep
+
+# Entorno — nunca commitear credenciales
+.env
+.env.local
+.env.*.local
+
+# Composer
+composer.phar
+
+# Editores / IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,558 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Flameware — generador de proyectos.
+ *
+ * Uso:
+ *   flameware new <nombre> [opciones]
+ */
+
+const FLAMEWARE_VERSION = '1.3.0';
+const FLAMEWARE_MIN_PHP = 80500;
+
+/*
+ * Esta comprobación va antes de cualquier require, y este archivo se mantiene
+ * parseable por PHP 8.0: si usara sintaxis nueva, una máquina con PHP viejo
+ * fallaría al parsear el archivo y nunca llegaría a mostrar este mensaje.
+ */
+if (PHP_VERSION_ID < FLAMEWARE_MIN_PHP) {
+    fwrite(STDERR, sprintf(
+        "\n  \033[31m✗\033[0m Flameware necesita PHP 8.5 o superior. Tienes PHP %s.\n\n"
+        . "    Binario: %s\n"
+        . "    Si tienes varias versiones instaladas, apunta el PATH a la 8.5.\n\n",
+        PHP_VERSION,
+        PHP_BINARY,
+    ));
+    exit(1);
+}
+
+require_once dirname(__DIR__) . '/lib/FieldSpec.php';
+require_once dirname(__DIR__) . '/lib/NamingConvention.php';
+require_once dirname(__DIR__) . '/lib/FieldParser.php';
+require_once dirname(__DIR__) . '/lib/SchemaReader.php';
+require_once dirname(__DIR__) . '/lib/ResourceGenerator.php';
+
+final class Cli
+{
+    private string $skeleton;
+
+    public function __construct()
+    {
+        // __DIR__ ya viene con los symlinks resueltos, así que esto funciona
+        // aunque el binario se invoque desde ~/.local/bin/flameware.
+        $this->skeleton = dirname(__DIR__) . '/skeleton';
+    }
+
+    public function run(array $argv): int
+    {
+        $command = $argv[1] ?? null;
+
+        return match ($command) {
+            'new'                 => $this->commandNew(array_slice($argv, 2)),
+            'make:resource'       => $this->commandMakeResource(array_slice($argv, 2)),
+            '--version', '-V'     => $this->commandVersion(),
+            'help', '--help', '-h', null => $this->commandHelp(),
+            default => $this->fail("Comando desconocido: {$command}\nEjecuta «flameware help» para ver el uso."),
+        };
+    }
+
+    // ---------------------------------------------------------------- comandos
+
+    private function commandNew(array $args): int
+    {
+        [$options, $positional] = $this->parseArgs($args);
+
+        $name = $positional[0] ?? null;
+
+        if ($name === null) {
+            return $this->fail('Falta el nombre del proyecto.  Uso: flameware new <nombre>');
+        }
+
+        if (!preg_match('/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/', $name)) {
+            return $this->fail("Nombre inválido: «{$name}». Usa letras, números, punto, guion o guion bajo.");
+        }
+
+        if (!is_dir($this->skeleton)) {
+            return $this->fail("No se encontró el skeleton en {$this->skeleton}");
+        }
+
+        $parent = $options['path'] ?? getcwd();
+        $target = rtrim($parent, '/') . '/' . $name;
+
+        if (file_exists($target)) {
+            return $this->fail("Ya existe: {$target}");
+        }
+
+        if (!is_dir($parent) || !is_writable($parent)) {
+            return $this->fail("El directorio destino no existe o no es escribible: {$parent}");
+        }
+
+        $slug        = $this->slugify($name);
+        $basePath    = $options['base-path'] ?? "/{$name}/api/";
+        $rewriteBase = $options['rewrite-base'] ?? $this->deriveRewriteBase($basePath, $name);
+
+        $replacements = [
+            '{{PROJECT_NAME}}' => $slug,
+            '{{VENDOR}}'       => $options['vendor'] ?? 'app',
+            '{{BASE_PATH}}'    => $basePath,
+            '{{REWRITE_BASE}}' => $rewriteBase,
+            '{{DB_NAME}}'      => $options['db'] ?? '',
+        ];
+
+        $this->banner($name);
+
+        $this->step('Copiando estructura del proyecto');
+        $this->copyTree($this->skeleton, $target);
+
+        $this->step('Aplicando plantillas');
+        $this->materializeStubs($target, $replacements);
+
+        if (!isset($options['no-install'])) {
+            $this->step('Instalando dependencias (composer install)');
+
+            if (!$this->composerInstall($target)) {
+                $this->warn('composer install falló. El proyecto quedó creado; ejecútalo a mano:');
+                $this->warn("  cd {$target} && composer install");
+                $this->nextSteps($name, $target, $basePath, installed: false);
+                return 1;
+            }
+        } else {
+            $this->step('Instalación de dependencias omitida (--no-install)');
+        }
+
+        if (!isset($options['no-git'])) {
+            $this->step('Inicializando repositorio git');
+            $this->gitInit($target);
+        }
+
+        $this->nextSteps($name, $target, $basePath, installed: !isset($options['no-install']));
+
+        return 0;
+    }
+
+    private function commandMakeResource(array $args): int
+    {
+        [$options, $positional] = $this->parseArgs($args);
+
+        $resource = $positional[0] ?? null;
+
+        if ($resource === null) {
+            return $this->fail('Falta el nombre del recurso.  Uso: flameware make:resource <Nombre>');
+        }
+
+        if (!preg_match('/^[A-Z][A-Za-z0-9]*$/', $resource)) {
+            return $this->fail("Nombre inválido: «{$resource}». Usa StudlyCase, por ejemplo «Product».");
+        }
+
+        $project = $options['project'] ?? getcwd();
+
+        if (!is_file($project . '/composer.json') || !is_dir($project . '/Config')) {
+            return $this->fail("No parece un proyecto Flameware: {$project}\n    Ejecuta el comando dentro del proyecto o pasa --project=<dir>.");
+        }
+
+        $token = NamingConvention::entityToken($resource);
+        $table = $options['table'] ?? $token;
+
+        echo "\n  \033[1;38;5;208m›\033[0m Generando el recurso \033[1m{$resource}\033[0m\n\n";
+
+        try {
+            $fields = $this->resolveFields($options, $token, $table);
+        } catch (RuntimeException $e) {
+            return $this->fail($e->getMessage());
+        }
+
+        $this->reportFields($fields);
+
+        try {
+            $generator = new ResourceGenerator($project, $resource, $table, $fields);
+            $written   = $generator->generate(isset($options['force']));
+        } catch (RuntimeException $e) {
+            return $this->fail($e->getMessage());
+        }
+
+        foreach ($written as $relative) {
+            echo "    \033[32m+\033[0m {$relative}\n";
+        }
+
+        $this->registerDependencies($project, $resource);
+        $this->rebuildRoutes($project);
+
+        echo "\n  \033[32m✓\033[0m Recurso \033[1m{$resource}\033[0m generado.\n";
+        echo "    \033[2mRevisa las reglas #[Assert] del RequestDto y los nombres de columna del EloquentModel.\033[0m\n\n";
+
+        return 0;
+    }
+
+    /**
+     * @return list<FieldSpec>
+     * @throws RuntimeException
+     */
+    private function resolveFields(array $options, string $token, string $table): array
+    {
+        if (isset($options['table']) && !isset($options['fields'])) {
+            $this->step("Leyendo el esquema de «{$table}»");
+
+            $reader = new SchemaReader($options['project'] ?? getcwd());
+
+            return $reader->read($table, $token);
+        }
+
+        if (isset($options['fields']) && is_string($options['fields'])) {
+            $this->step('Resolviendo campos desde --fields');
+
+            $parser = new FieldParser();
+
+            return $parser->parse($options['fields'], $token);
+        }
+
+        $this->warn('Sin --table ni --fields: se genera solo la PK, tendrás que agregar los atributos a mano.');
+
+        return [new FieldSpec(
+            property: 'id',
+            column: NamingConvention::toColumn('id', 'int', $token),
+            phpType: 'int',
+            isPrimaryKey: true,
+        )];
+    }
+
+    /** @param list<FieldSpec> $fields */
+    private function reportFields(array $fields): void
+    {
+        echo "\n";
+
+        foreach ($fields as $field) {
+            printf(
+                "    \033[2m%-28s\033[0m → \033[36m%-20s\033[0m %s%s\n",
+                $field->column,
+                $field->property,
+                $field->hint(),
+                $field->isPrimaryKey ? " \033[2m(PK)\033[0m" : '',
+            );
+        }
+
+        echo "\n";
+    }
+
+    /**
+     * Inserta las dos interfaces del recurso en el mapa de PHP-DI.
+     */
+    private function registerDependencies(string $project, string $resource): void
+    {
+        $path = $project . '/Config/Dependencies.php';
+
+        if (!is_file($path)) {
+            $this->warn('No se encontró Config/Dependencies.php — registra las interfaces a mano.');
+            return;
+        }
+
+        $contents = (string) file_get_contents($path);
+
+        if (str_contains($contents, "I{$resource}Repository::class")) {
+            $this->step('Las interfaces ya estaban registradas en el contenedor');
+            return;
+        }
+
+        $entries = sprintf(
+            "            \\App\\Repository\\I%sRepository::class => autowire(\\App\\Repository\\%sRepository::class),\n"
+            . "            \\App\\Services\\I%sService::class => autowire(\\App\\Services\\%sService::class),",
+            $resource, $resource, $resource, $resource,
+        );
+
+        // Quitamos el marcador vacío de la plantilla la primera vez.
+        $contents = preg_replace('/\n\s*\/\/\n(\s*\];)/', "\n$1", $contents, 1) ?? $contents;
+
+        $updated = preg_replace('/(return \[\n)/', "$1" . $entries . "\n", $contents, 1);
+
+        if ($updated === null || $updated === $contents) {
+            $this->warn('No se pudo editar Config/Dependencies.php — registra las interfaces a mano.');
+            return;
+        }
+
+        file_put_contents($path, $updated);
+        $this->step('Interfaces registradas en Config/Dependencies.php');
+    }
+
+    private function rebuildRoutes(string $project): void
+    {
+        if (!is_dir($project . '/vendor')) {
+            $this->warn('vendor/ no existe — ejecuta «composer install» y luego «composer routes».');
+            return;
+        }
+
+        exec(sprintf('php %s 2>&1', escapeshellarg($project . '/Bin/BuildRouteCache.php')), $output, $exitCode);
+
+        if ($exitCode === 0) {
+            $this->step(trim(implode(' ', $output)));
+            return;
+        }
+
+        $this->warn('No se pudo reconstruir el caché de rutas — ejecuta «composer routes».');
+    }
+
+    private function commandVersion(): int
+    {
+        echo 'Flameware ' . FLAMEWARE_VERSION . PHP_EOL;
+        return 0;
+    }
+
+    private function commandHelp(): int
+    {
+        $b = "\033[1m";
+        $c = "\033[36m";
+        $d = "\033[2m";
+        $r = "\033[0m";
+        $v = FLAMEWARE_VERSION;
+
+        echo <<<HELP
+
+
+          {$b}Flameware{$r} {$d}v{$v}{$r} — generador de proyectos
+
+          {$b}USO{$r}
+            {$c}flameware new <nombre>{$r} [opciones]
+
+          {$b}OPCIONES{$r}
+            {$c}--path=<dir>{$r}           Directorio padre donde crear el proyecto {$d}(por defecto: el actual){$r}
+            {$c}--base-path=<ruta>{$r}     Prefijo de las rutas del API {$d}(por defecto: /<nombre>/api/){$r}
+            {$c}--rewrite-base=<ruta>{$r}  RewriteBase del .htaccess {$d}(derivado de --base-path){$r}
+            {$c}--db=<nombre>{$r}          Base de datos de Eloquent {$d}(vacío = sin base de datos){$r}
+            {$c}--vendor=<nombre>{$r}      Vendor del composer.json {$d}(por defecto: app){$r}
+            {$c}--no-install{$r}           No ejecutar composer install
+            {$c}--no-git{$r}               No inicializar el repositorio git
+
+          {$b}EJEMPLOS{$r}
+            {$d}# API sin base de datos, servida desde htdocs/mi-api/{$r}
+            flameware new mi-api
+
+            {$d}# API con Eloquent apuntando a la base «tienda»{$r}
+            flameware new tienda-api --db=tienda
+
+            {$d}# API en la raíz del dominio{$r}
+            flameware new checkout --base-path=/ --rewrite-base=/
+
+          {$b}DENTRO DE UN PROYECTO{$r}
+            {$c}flameware make:resource <Nombre>{$r} [opciones]
+                Genera las 10 clases del recurso: Model, EloquentModel, Repository
+                e interfaz, Mapper, los dos DTOs, Service e interfaz, y Controller
+                con el CRUD enrutado. Registra las interfaces en el contenedor y
+                reconstruye el caché de rutas.
+
+              {$c}--table=<tabla>{$r}       Lee el esquema real y deriva los campos de él
+              {$c}--fields=<spec>{$r}       Declara los campos: "name:string,price:float"
+              {$c}--force{$r}               Sobrescribe archivos existentes
+              {$c}--project=<dir>{$r}       Proyecto destino {$d}(por defecto: el actual){$r}
+
+              {$d}# desde la tabla — los nombres de columna se leen, no se escriben{$r}
+              flameware make:resource Product --table=FLCM_PRODUCT
+
+              {$d}# sin base de datos a mano{$r}
+              flameware make:resource Product --fields="name:string,price:float,stock:int"
+
+            {$c}composer routes{$r}        Reconstruye el caché de rutas tras agregar un #[Route]
+
+
+        HELP;
+
+        return 0;
+    }
+
+    // ------------------------------------------------------------ generación
+
+    private function copyTree(string $source, string $target): void
+    {
+        mkdir($target, 0755, true);
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+
+        foreach ($iterator as $item) {
+            $destination = $target . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+
+            if ($item->isDir()) {
+                mkdir($destination, 0755, true);
+                continue;
+            }
+
+            copy($item->getPathname(), $destination);
+            chmod($destination, $item->isExecutable() ? 0755 : 0644);
+        }
+    }
+
+    /**
+     * Convierte los *.stub en sus archivos reales y sustituye los placeholders.
+     */
+    private function materializeStubs(string $target, array $replacements): void
+    {
+        $renames = [
+            'composer.json.stub' => 'composer.json',
+            'env.stub'           => '.env.local',
+            'gitignore.stub'     => '.gitignore',
+            'htaccess.stub'      => '.htaccess',
+        ];
+
+        foreach ($renames as $stub => $final) {
+            $path = $target . '/' . $stub;
+
+            if (!is_file($path)) {
+                continue;
+            }
+
+            $contents = strtr((string) file_get_contents($path), $replacements);
+
+            file_put_contents($target . '/' . $final, $contents);
+            unlink($path);
+        }
+
+        // .env.local queda fuera de git pero puede contener credenciales.
+        chmod($target . '/.env.local', 0600);
+
+        // Copia de referencia versionable, sin valores sensibles.
+        copy($target . '/.env.local', $target . '/.env.example');
+        chmod($target . '/.env.example', 0644);
+    }
+
+    private function composerInstall(string $target): bool
+    {
+        // El post-install-cmd del composer.json construye el caché de rutas,
+        // así que no hace falta invocarlo por separado.
+        $command = sprintf('composer install --no-interaction --working-dir=%s 2>&1', escapeshellarg($target));
+
+        passthru($command, $exitCode);
+
+        return $exitCode === 0;
+    }
+
+    private function gitInit(string $target): void
+    {
+        $git = sprintf(
+            'git -C %s init --quiet --initial-branch=main 2>/dev/null',
+            escapeshellarg($target)
+        );
+
+        exec($git, $_, $exitCode);
+
+        if ($exitCode !== 0) {
+            $this->warn('No se pudo inicializar git (¿está instalado?). Continuando.');
+        }
+    }
+
+    // ------------------------------------------------------------- utilidades
+
+    /**
+     * Separa --clave=valor / --bandera de los argumentos posicionales.
+     *
+     * @return array{0: array<string,string>, 1: list<string>}
+     */
+    private function parseArgs(array $args): array
+    {
+        $options    = [];
+        $positional = [];
+
+        foreach ($args as $arg) {
+            if (!str_starts_with($arg, '--')) {
+                $positional[] = $arg;
+                continue;
+            }
+
+            $arg = substr($arg, 2);
+
+            if (str_contains($arg, '=')) {
+                [$key, $value] = explode('=', $arg, 2);
+                $options[$key] = $value;
+                continue;
+            }
+
+            $options[$arg] = true;
+        }
+
+        return [$options, $positional];
+    }
+
+    /**
+     * «Mi API Nueva» → «mi-api-nueva» para el campo name del composer.json,
+     * que solo admite minúsculas, números y separadores.
+     */
+    private function slugify(string $name): string
+    {
+        $slug = strtolower($name);
+        $slug = preg_replace('/[^a-z0-9]+/', '-', $slug) ?? $slug;
+
+        return trim($slug, '-') ?: 'api';
+    }
+
+    /**
+     * BASE_PATH es el prefijo completo de las rutas (/mi-api/api/) mientras que
+     * RewriteBase es la carpeta donde vive el front controller (/mi-api/).
+     */
+    private function deriveRewriteBase(string $basePath, string $name): string
+    {
+        if ($basePath === '/' || $basePath === '') {
+            return '/';
+        }
+
+        $segments = array_values(array_filter(explode('/', $basePath), 'strlen'));
+
+        if ($segments === []) {
+            return '/';
+        }
+
+        // Descartamos el último segmento (el del API) si hay más de uno.
+        if (count($segments) > 1) {
+            array_pop($segments);
+        }
+
+        return '/' . implode('/', $segments) . '/';
+    }
+
+    // ------------------------------------------------------------------ salida
+
+    private function banner(string $name): void
+    {
+        echo "\n\033[1;38;5;208m  Flameware\033[0m \033[2mv" . FLAMEWARE_VERSION . "\033[0m\n";
+        echo "  \033[2mCreando el proyecto\033[0m \033[1m{$name}\033[0m\n\n";
+    }
+
+    private function step(string $message): void
+    {
+        echo "  \033[38;5;208m›\033[0m {$message}\n";
+    }
+
+    private function warn(string $message): void
+    {
+        echo "  \033[33m!\033[0m {$message}\n";
+    }
+
+    private function fail(string $message): int
+    {
+        fwrite(STDERR, "\n  \033[31m✗\033[0m {$message}\n\n");
+        return 1;
+    }
+
+    private function nextSteps(string $name, string $target, string $basePath, bool $installed): void
+    {
+        $b = "\033[1m";
+        $c = "\033[36m";
+        $d = "\033[2m";
+        $r = "\033[0m";
+
+        echo "\n  \033[32m✓\033[0m {$b}Proyecto creado en{$r} {$target}\n\n";
+        echo "  {$b}SIGUIENTES PASOS{$r}\n";
+        echo "    {$c}cd {$name}{$r}\n";
+
+        if (!$installed) {
+            echo "    {$c}composer install{$r}\n";
+        }
+
+        echo "    {$d}# revisa .env.local — credenciales de base de datos, SMTP y CORS{$r}\n\n";
+        echo "  {$b}COMPROBACIÓN{$r}\n";
+        echo "    {$d}curl http://localhost{$basePath}health{$r}\n\n";
+        echo "  {$d}Al agregar un #[Route] nuevo, ejecuta{$r} {$c}composer routes{$r}\n\n";
+    }
+}
+
+exit((new Cli())->run($argv));

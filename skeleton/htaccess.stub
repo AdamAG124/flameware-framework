@@ -1,0 +1,15 @@
+RewriteEngine On
+RewriteBase {{REWRITE_BASE}}
+
+# Todo lo que no sea un archivo o directorio real entra por el front controller.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [L]
+
+# Bloquea el acceso directo a archivos sensibles.
+<FilesMatch "^(\.env.*|composer\.(json|lock)|.*\.stub)$">
+    Require all denied
+</FilesMatch>
+
+# Storage no debe servirse por HTTP.
+RedirectMatch 404 ^/.*/Storage/.*$
