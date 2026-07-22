@@ -10,7 +10,7 @@ declare(strict_types=1);
  *   flameware new <nombre> [opciones]
  */
 
-const FLAMEWARE_VERSION = '1.3.0';
+const FLAMEWARE_VERSION = '1.4.0';
 const FLAMEWARE_MIN_PHP = 80500;
 
 /*
@@ -31,6 +31,7 @@ if (PHP_VERSION_ID < FLAMEWARE_MIN_PHP) {
 
 require_once dirname(__DIR__) . '/lib/FieldSpec.php';
 require_once dirname(__DIR__) . '/lib/NamingConvention.php';
+require_once dirname(__DIR__) . '/lib/ModelReader.php';
 require_once dirname(__DIR__) . '/lib/FieldParser.php';
 require_once dirname(__DIR__) . '/lib/SchemaReader.php';
 require_once dirname(__DIR__) . '/lib/ResourceGenerator.php';
@@ -166,8 +167,21 @@ final class Cli
 
         $this->reportFields($fields);
 
+        $cycle = $this->referenceCycle(new ModelReader($project), $resource, $fields);
+
+        if ($cycle !== null) {
+            return $this->fail(sprintf(
+                "Las referencias forman un ciclo: %s.\n"
+                . "      Cada Model instancia en su constructor los objetos que lo tipan, así que\n"
+                . "      «new %s()» no terminaría nunca. Rompe el ciclo dejando uno de los dos\n"
+                . "      lados como la clave suelta (por ejemplo «:int») en vez del objeto.",
+                implode(' → ', $cycle),
+                $resource,
+            ));
+        }
+
         try {
-            $generator = new ResourceGenerator($project, $resource, $table, $fields);
+            $generator = new ResourceGenerator($project, $resource, $table, $fields, $this->skeleton);
             $written   = $generator->generate(isset($options['force']));
         } catch (RuntimeException $e) {
             return $this->fail($e->getMessage());
@@ -203,19 +217,60 @@ final class Cli
         if (isset($options['fields']) && is_string($options['fields'])) {
             $this->step('Resolviendo campos desde --fields');
 
-            $parser = new FieldParser();
+            $parser = new FieldParser(new ModelReader($options['project'] ?? getcwd()));
 
             return $parser->parse($options['fields'], $token);
         }
 
         $this->warn('Sin --table ni --fields: se genera solo la PK, tendrás que agregar los atributos a mano.');
 
+        $property = NamingConvention::tokenToEntity($token) . 'Id';
+
         return [new FieldSpec(
-            property: 'id',
-            column: NamingConvention::toColumn('id', 'int', $token),
+            property: $property,
+            column: NamingConvention::toColumn($property, 'int', $token),
             phpType: 'int',
             isPrimaryKey: true,
         )];
+    }
+
+    /**
+     * Primer ciclo de referencias alcanzable desde el recurso, o null si no hay.
+     *
+     * Importa porque el constructor de un Model instancia los objetos que lo
+     * tipan: si Client tiene un Person y Person tiene un Client, «new Client()»
+     * recursa hasta desbordar la pila. Vale más detectarlo al generar que verlo
+     * caer en la primera petición.
+     *
+     * @param  list<FieldSpec> $fields
+     * @return ?list<string>
+     */
+    private function referenceCycle(ModelReader $models, string $resource, array $fields): ?array
+    {
+        $graph = [$resource => array_values(array_unique(array_map(
+            static fn (FieldSpec $field): string => $field->phpType,
+            array_filter($fields, static fn (FieldSpec $field): bool => $field->isModel()),
+        )))];
+
+        $walk = static function (string $class, array $path) use (&$walk, &$graph, $models): ?array {
+            $graph[$class] ??= $models->referencesOf($class);
+
+            foreach ($graph[$class] as $next) {
+                if (in_array($next, $path, true)) {
+                    return [...$path, $next];
+                }
+
+                $found = $walk($next, [...$path, $next]);
+
+                if ($found !== null) {
+                    return $found;
+                }
+            }
+
+            return null;
+        };
+
+        return $walk($resource, [$resource]);
     }
 
     /** @param list<FieldSpec> $fields */
@@ -341,7 +396,9 @@ final class Cli
                 reconstruye el caché de rutas.
 
               {$c}--table=<tabla>{$r}       Lee el esquema real y deriva los campos de él
-              {$c}--fields=<spec>{$r}       Declara los campos: "name:string,price:float"
+              {$c}--fields=<spec>{$r}       Declara los campos: "productId:int,price:float"
+                                  El primero es la PK. El tipo puede ser un escalar
+                                  o el nombre de un Model ya generado.
               {$c}--force{$r}               Sobrescribe archivos existentes
               {$c}--project=<dir>{$r}       Proyecto destino {$d}(por defecto: el actual){$r}
 
@@ -349,7 +406,10 @@ final class Cli
               flameware make:resource Product --table=FLCM_PRODUCT
 
               {$d}# sin base de datos a mano{$r}
-              flameware make:resource Product --fields="name:string,price:float,stock:int"
+              flameware make:resource Product --fields="productId:int,name:string,price:float"
+
+              {$d}# con una referencia a un recurso ya generado{$r}
+              flameware make:resource Client --fields="clientId:int,personId:Person"
 
             {$c}composer routes{$r}        Reconstruye el caché de rutas tras agregar un #[Route]
 

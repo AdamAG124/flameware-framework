@@ -99,11 +99,12 @@ mi-api/
 ├── Routing/                   Router, Route, Http, ControllerDiscovery
 ├── Controllers/               HealthController de ejemplo
 ├── DTOs/Request|Response/     Contratos de entrada y salida del API
-├── Mappers/                   Conversión DTO <-> Model
+├── Mappers/                   Conversión DTO <-> Model (los usa el Service)
 ├── Models/                    Objetos de dominio (POPO, sin Eloquent)
 ├── Repository/                Interfaces de persistencia y sus implementaciones
 ├── EloquentModels/            Modelos de Eloquent y conversión Model <-> EloquentModel
 ├── Services/                  Lógica de negocio
+├── Support/Json.php           Cuerpo de la petición → DTO, y DTO → respuesta JSON
 └── Storage/
     ├── route-cache.php        Generado, fuera de git
     └── logs/app.log
@@ -175,7 +176,7 @@ activo.
 **De una especificación** (`--fields`): sin tocar la base de datos.
 
 ```bash
-flameware make:resource Product --fields="name:string,price:float,stock:int,createdAt:?datetime"
+flameware make:resource Product --fields="productId:int,name:string,price:float,createdAt:?datetime"
 ```
 
 Tipos válidos: `string`, `text`, `int`, `float`, `decimal`, `bool`, `date`,
@@ -183,8 +184,74 @@ Tipos válidos: `string`, `text`, `int`, `float`, `decimal`, `bool`, `date`,
 por convención y se corrigen en el `EloquentModel`, que es el único archivo
 donde aparecen.
 
-**Sin ninguno de los dos**: genera las diez clases con solo la PK, para
-completar a mano.
+Se generan **exactamente** los campos declarados, ninguno más: el generador no
+añade una PK por su cuenta, así que tú la nombras como la nombras en la tabla.
+
+**El primer campo es la clave primaria**, y por eso tiene que nombrar al
+recurso: en `Product` valen `id`, `productId` o `idProduct`. El generador falla
+con un mensaje explícito si el primero es otra cosa.
+
+Solo el primero opta a PK. Un marcador `ID` más abajo es una foreign key
+aunque nombre al propio recurso:
+
+```bash
+--fields="productId:int,name:string,categoryId:int,idSupplier:int"
+#          └─ PK, ID_PRODUCT          └─ FK, ID_CATEGORY
+#                                                    └─ FK, ID_SUPPLIER
+```
+
+La PK no aparece en el `RequestDto` —el cliente no la envía— pero sí en el
+`ResponseDto`, y es la que usan `findOrFail()` en el Repository y el `setter`
+del `update()` en el Controller.
+
+#### Referencias a otros recursos
+
+El tipo de un campo puede ser el nombre de un Model ya generado. La propiedad
+queda tipada con esa clase en vez de con un entero suelto:
+
+```bash
+flameware make:resource Client --fields="clientId:int,code:string,personId:Person"
+```
+
+```php
+private Person $personId;          // Models/Client.php
+
+public function __construct()
+{
+    $this->personId = new Person(); // un objeto no tiene neutro escalar
+}
+```
+
+El Model referenciado **tiene que existir ya**: no se puede tipar una propiedad
+con una clase que nadie ha generado, así que el comando falla y te dice cuál
+generar primero.
+
+Hacia fuera nada cambia: el JSON del API sigue siendo plano y la referencia
+viaja como la clave que la identifica, así que en los DTOs `personId` es un
+`int`. La conversión ocurre en dos sitios, y en ambos el objeto se arma **solo
+con su clave**:
+
+```php
+// ClientMapper::toModel() — al entrar
+$personId = new Person();
+$personId->setPersonId($dto->personId);
+$model->setPersonId($personId);
+
+// ClientMapper::toDto() — al salir
+$dto->personId = $model->getPersonId()->getPersonId();
+```
+
+Cargar el `Person` completo es trabajo del Service. El `EloquentModel` no puede
+hacerlo —depender de un Repository desde ahí rompería las capas— y el Mapper no
+debe: solo traduce.
+
+**Los ciclos se rechazan al generar.** Si `Client` tiene un `Person` y `Person`
+tiene un `Client`, `new Client()` recursaría hasta desbordar la pila. El
+generador recorre las referencias antes de escribir nada y aborta con la ruta
+del ciclo; se rompe dejando uno de los dos lados como `:int`.
+
+**Sin ninguno de los dos**: genera las diez clases con solo la PK —nombrada
+`<recurso>Id`— para completar a mano.
 
 #### Convención de columnas
 
@@ -202,8 +269,8 @@ Al nombre se le quita el marcador y el token de la entidad, y lo que queda pasa
 a camelCase:
 
 ```
-ID_EMPLOYEE             → id            (PK de la tabla EMPLOYEE)
-ID_CLIENT               → clientId      (FK: se distingue con el sufijo Id)
+ID_EMPLOYEE             → employeeId    (PK de la tabla EMPLOYEE)
+ID_CLIENT               → clientId      (FK en esa misma tabla)
 DSC_ADDRESS             → address
 NUM_QUANTITY            → quantity
 FEC_CREATION            → creation
@@ -220,9 +287,15 @@ pero si la columna es `varchar` el estado se genera como `string`.
 `TOTAL_AMOUNT` el marcador forma parte del nombre y no se descarta: la propiedad
 queda como `totalAmount`, no como `total`.
 
-**`ID` distingue PK de FK.** En la tabla `INVOICE`, la columna `ID_INVOICE` es la
-primary key y produce `id`; cualquier otra columna `ID_*` es una foreign key y
-lleva el sufijo `Id` — `ID_CLIENT` produce `clientId`.
+**El nombre no distingue PK de FK.** Toda columna `ID_*` produce la misma forma
+—lo que acompaña al marcador, en camelCase, con `Id` al final—, sea la clave de
+la tabla o apunte a otra. En `INVOICE`, `ID_INVOICE` produce `invoiceId` y
+`ID_CLIENT` produce `clientId`. Cuál es la PK no se adivina del nombre: con
+`--table` lo dice el esquema (`Key = PRI`) y con `--fields` lo dice la posición.
+
+Ninguna propiedad se llama `id` a secas, y esa es la intención: en el Model
+convive la clave propia con las ajenas, y `personId` junto a `countryId` se lee
+sin ambigüedad donde `id` junto a `countryId` no.
 
 Límites conocidos, todos corregibles a mano en el archivo generado:
 
@@ -242,18 +315,27 @@ siguiente en un solo lenguaje, y ninguna capa por encima del `Repository` sabe
 que Eloquent existe.
 
 ```
-Controller  →  RequestDto  →  Mapper  →  Model  →  Service
-                                           ↓
-                                      Repository          (interfaz: solo Model)
-                                           ↓
-                                     EloquentModel        (única capa con columnas)
-                                           ↓
-                                          BD
+Controller  →  RequestDto  →  Service        (contrato: solo DTOs)
+                                  ↓
+                               Mapper  →  Model
+                                  ↓
+                             Repository       (interfaz: solo Model)
+                                  ↓
+                            EloquentModel     (única capa con columnas)
+                                  ↓
+                                 BD
 ```
 
-De regreso, el `Repository` devuelve `Model` y el `Mapper` lo convierte en
-`ResponseDto`. Un `EloquentModel` nunca sale de `Repository/`, y un `Dto` nunca
-entra en `Services/`.
+De regreso sube por el mismo camino: el `Repository` devuelve `Model`, el
+`Mapper` lo convierte en `ResponseDto` y el `Service` lo entrega ya traducido.
+
+**El Service es la frontera de traducción.** Hacia arriba habla DTOs y hacia
+abajo Models, así que el Mapper se inyecta ahí y no en el Controller. Eso deja
+cada extremo hablando un solo idioma: el Controller no llega a ver el dominio y
+el Repository no llega a ver el contrato del API.
+
+Un `EloquentModel` nunca sale de `Repository/`, y un `Model` nunca sale de
+`Services/`.
 
 #### Models — objetos de dominio
 
@@ -526,41 +608,77 @@ firmas ya son concretas.
 
 #### Service y Controller
 
-El Service recibe la interfaz del Repository, nunca la implementación:
+El Service recibe la interfaz del Repository —nunca la implementación— y el
+Mapper. Su contrato está escrito en DTOs por los dos lados:
 
 ```php
 <?php
 
 namespace App\Services;
 
-use App\Models\Product;
+use App\DTOs\Request\ProductRequestDto;
+use App\DTOs\Response\ProductResponseDto;
+use App\Mappers\ProductMapper;
 use App\Repository\IProductRepository;
 
 class ProductService implements IProductService
 {
     public function __construct(
         private readonly IProductRepository $repository,
+        private readonly ProductMapper $mapper,
     ) {}
 
-    public function create(Product $product): Product
+    public function create(ProductRequestDto $dto): ProductResponseDto
     {
-        return $this->repository->save($product);
+        return $this->mapper->toDto(
+            $this->repository->save($this->mapper->toModel($dto)),
+        );
     }
 }
 ```
+
+El Controller no conoce el Mapper ni el dominio: entra un `RequestDto`, sale un
+`ResponseDto`, y serializar es trabajo de `App\Support\Json`. Cada acción cabe
+en una expresión:
 
 ```php
 #[Route(Http::POST, 'products')]
 public function store(): Response
 {
-    $request = Request::createFromGlobals();
-    $dto = $this->serializer->deserialize($request->getContent(), ProductRequestDto::class, 'json');
-
-    $product = $this->service->create($this->mapper->toModel($dto));
-
-    return $this->json($this->mapper->toDto($product));
+    return Json::response(
+        $this->service->create(Json::body(ProductRequestDto::class)),
+        Response::HTTP_CREATED,
+    );
 }
 ```
+
+Por eso el constructor del Controller solo pide el Service:
+
+```php
+public function __construct(
+    private readonly IProductService $service,
+) {}
+```
+
+#### App\Support\Json
+
+Cuatro métodos estáticos, las dos direcciones del JSON del API:
+
+| | |
+|---|---|
+| `Json::body(ProductRequestDto::class)` | cuerpo de la petición → DTO de entrada |
+| `Json::response($dto)` | DTO → respuesta serializada por JMS *(200 por defecto)* |
+| `Json::noContent()` | 204 sin cuerpo, la respuesta de un DELETE correcto |
+| `Json::error('No encontrado.', 404)` | error con el mismo formato que usa el router |
+
+Es una clase, no un `BaseController` ni un trait: los controladores no heredan
+nada y estos métodos se pueden llamar desde cualquier parte. El serializador de
+JMS vive ahí dentro, estático y perezoso — construirlo compila el grafo de
+metadatos, así que se hace como mucho una vez por petición en lugar de una por
+controlador instanciado.
+
+`make:resource` copia el archivo al proyecto si no está, y nunca lo sobrescribe:
+si lo editas, tus cambios se quedan.
 
 #### Registro en el contenedor
 

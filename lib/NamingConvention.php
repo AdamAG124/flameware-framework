@@ -18,7 +18,8 @@ declare(strict_types=1);
  * Al nombre se le quita el marcador de tipo y el token de la entidad, y lo que
  * queda pasa a camelCase:
  *
- *   ID_PRODUCT              -> id
+ *   ID_PRODUCT              -> productId
+ *   ID_CLIENT               -> clientId
  *   DSC_PRODUCT_NAME        -> name
  *   NUM_QUANTITY            -> quantity
  *   FEC_CREATION            -> creation
@@ -52,13 +53,10 @@ final class NamingConvention
 
         $rest = (string) preg_replace('/^(' . implode('|', self::PREFIXES) . ')_/', '', $column);
 
-        // ID_PRODUCT en la tabla PRODUCT es la PK; ID_CLIENT en esa misma tabla
-        // es una foreign key, y se distingue nombrándola clientId.
+        // Toda columna con marcador ID se nombra igual, sea la PK de la tabla o
+        // una foreign key: lo que acompaña al marcador, en camelCase, con Id
+        // al final. Cuál es la PK lo dice el esquema, no el nombre.
         if (str_starts_with($column, 'ID_')) {
-            if ($rest === $token) {
-                return 'id';
-            }
-
             if (str_starts_with($rest, $token . '_')) {
                 $rest = substr($rest, strlen($token) + 1);
             }
@@ -84,12 +82,19 @@ final class NamingConvention
      */
     public static function toColumn(string $property, string $phpType, string $token): string
     {
+        $snake = static fn (string $value): string
+            => strtoupper((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $value));
+
         if ($property === 'id') {
             return 'ID_' . $token;
         }
 
-        $snake = static fn (string $value): string
-            => strtoupper((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $value));
+        // El marcador ID también puede venir antepuesto en la propiedad, no
+        // solo como sufijo — por ejemplo idCategory frente a categoryId. La
+        // columna es la misma en ambos casos.
+        if (preg_match('/^id[A-Z]/', $property)) {
+            return 'ID_' . $snake(lcfirst(substr($property, 2)));
+        }
 
         // Los montos llevan AMOUNT pospuesto y sin token: totalAmount -> TOTAL_AMOUNT.
         if (str_ends_with($property, 'Amount')) {
@@ -112,6 +117,29 @@ final class NamingConvention
         };
 
         return "{$prefix}_{$token}_" . $snake($property);
+    }
+
+    /** «CLIENT_BUSINESS» => «clientBusiness». Inversa de entityToken(). */
+    public static function tokenToEntity(string $token): string
+    {
+        return self::camel($token);
+    }
+
+    /**
+     * ¿La propiedad nombra la clave del propio recurso, o la de otro?
+     *
+     * Un atributo con marcador ID solo es la PK si lo que acompaña al marcador
+     * es la entidad misma; cualquier otra cosa apunta fuera de la tabla y es
+     * una foreign key. En Person: personId sí, categoryId no.
+     */
+    public static function isPrimaryKeyName(string $property, string $token): bool
+    {
+        $property = strtolower($property);
+        $entity   = strtolower(str_replace('_', '', $token));
+
+        return $property === 'id'
+            || $property === $entity . 'id'
+            || $property === 'id' . $entity;
     }
 
     /**

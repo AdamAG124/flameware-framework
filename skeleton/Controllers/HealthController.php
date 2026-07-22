@@ -5,9 +5,7 @@ namespace App\Controllers;
 use App\DTOs\Response\HealthResponseDto;
 use App\Routing\Http;
 use App\Routing\Route;
-use JMS\Serializer\SerializerBuilder;
-use JMS\Serializer\SerializerInterface;
-use Symfony\Component\HttpFoundation\JsonResponse;
+use App\Support\Json;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
@@ -16,13 +14,6 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class HealthController
 {
-    private SerializerInterface $serializer;
-
-    public function __construct()
-    {
-        $this->serializer = SerializerBuilder::create()->build();
-    }
-
     #[Route(Http::GET, 'health')]
     public function check(): Response
     {
@@ -31,11 +22,6 @@ class HealthController
         $dto->message = 'API operativa.';
         $dto->php = PHP_VERSION;
 
-        return (new JsonResponse(
-            $this->serializer->serialize($dto, 'json'),
-            Response::HTTP_OK,
-            [],
-            true
-        ))->send();
+        return Json::response($dto);
     }
 }
