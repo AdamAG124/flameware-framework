@@ -22,7 +22,8 @@ en ese caso, un fork es el camino natural y no me molesta en absoluto.
 
 Un comando crea un API PHP lista para trabajar: estructura de directorios,
 dependencias instaladas, routing por atributos, Eloquent configurado y el caché
-de rutas construido.
+de rutas construido. Con `--web`, el mismo proyecto sirve además páginas HTML
+renderizadas en el servidor, con su SEO declarado desde el controlador.
 
 ## Instalación
 
@@ -70,6 +71,8 @@ flameware new mi-api
 | `--rewrite-base=<ruta>` | `RewriteBase` del `.htaccess` | derivado de `--base-path` |
 | `--db=<nombre>` | Base de datos de Eloquent | vacío (sin base de datos) |
 | `--vendor=<nombre>` | Vendor del `composer.json` | `app` |
+| `--web` | Agrega la capa de vistas: `View`, `Seo`, `Views/` y `Public/` | |
+| `--app-name=<nombre>` | Nombre del sitio para el `<title>` (con `--web`) | derivado del nombre |
 | `--no-install` | No ejecutar `composer install` | |
 | `--no-git` | No inicializar el repositorio git | |
 
@@ -79,6 +82,12 @@ flameware new tienda-api --db=tienda
 
 # API servido desde la raíz del dominio en lugar de un subdirectorio
 flameware new checkout --base-path=/ --rewrite-base=/
+
+# Sitio con vistas: páginas en /mi-sitio/ y API en /mi-sitio/api/
+flameware new mi-sitio --web --app-name="Mi Sitio"
+
+# Sitio con vistas en la raíz del dominio: páginas en / y API en /api/
+flameware new tienda --web --base-path=/api/ --rewrite-base=/
 ```
 
 ## Qué genera
@@ -92,11 +101,11 @@ mi-api/
 ├── .htaccess                  Rewrite al front controller + bloqueo de archivos sensibles
 ├── .gitignore
 ├── composer.json              Dependencias + script «composer routes»
-├── Bin/BuildRouteCache.php    Escanea #[Route] y escribe el caché
+├── Bin/BuildRouteCache.php    Escanea #[Route] y #[Page] y escribe el caché
 ├── Config/
 │   ├── Config.php             Carga .env.local y expone cada clave como constante
 │   └── Dependencies.php       Mapa interfaz => implementación para PHP-DI
-├── Routing/                   Router, Route, Http, ControllerDiscovery
+├── Routing/                   Router, Route, Page, Http, ControllerDiscovery
 ├── Controllers/               HealthController de ejemplo
 ├── DTOs/Request|Response/     Contratos de entrada y salida del API
 ├── Mappers/                   Conversión DTO <-> Model (los usa el Service)
@@ -116,6 +125,26 @@ Tras generar, `curl http://localhost/mi-api/api/health` devuelve:
 {"success":true,"message":"API operativa.","php":"8.5.7"}
 ```
 
+Con `--web` el proyecto recibe además la capa de vistas:
+
+```
+mi-sitio/
+├── Controllers/HomeController.php   Portada de ejemplo con #[Page] y Seo
+├── Support/
+│   ├── View.php                     View::render(), View::fetch(), View::error()
+│   ├── Seo.php                      Metadatos SEO de una página
+│   ├── Template.php                 El $this dentro de las vistas
+│   └── Url.php                      Rutas de página, archivos de Public/ y URLs absolutas
+├── Views/
+│   ├── layouts/main.php             Documento HTML: <head> con el SEO y content()
+│   ├── pages/home.php               Vistas de página
+│   ├── components/                  navbar.php, card.php
+│   └── errors/                      404.php y 500.php, los usa el router
+└── Public/css/app.css               Archivos estáticos, servidos directamente por Apache
+```
+
+Y `http://localhost/mi-sitio/` muestra la portada en HTML.
+
 ## Trabajar en un proyecto generado
 
 Un endpoint nuevo son tres pasos:
@@ -131,7 +160,8 @@ composer routes    # reconstruye Storage/route-cache.php
 ```
 
 El caché se reconstruye solo tras cada `composer install` y `composer update`.
-Hay que ejecutarlo a mano únicamente al agregar, quitar o mover un `#[Route]`.
+Hay que ejecutarlo a mano únicamente al agregar, quitar o mover un `#[Route]` o
+un `#[Page]`.
 
 Las clases concretas se resuelven por autowiring: PHP-DI lee los type hints del
 constructor. Solo hay que registrar en `Config/Dependencies.php` las interfaces:
@@ -695,6 +725,196 @@ public function interfaceMap(): array
 }
 ```
 
+### Vistas y SEO
+
+En un proyecto creado con `--web`, el mismo código sirve el API y un sitio con
+páginas renderizadas en el servidor. El HTML sale completo desde PHP, así que
+los buscadores lo indexan sin ejecutar JavaScript. No hay motor de plantillas
+ni dependencias nuevas: las vistas son PHP plano.
+
+Las capas no cambian. El controlador pide los datos al Service como siempre;
+lo único distinto es que en vez de `Json::response()` devuelve una vista.
+
+#### Rutas: `#[Page]` y `#[Route]`
+
+`#[Page]` funciona igual que `#[Route]`, pero el router la registra bajo
+`WEB_BASE_PATH` en lugar de `BASE_PATH`:
+
+```php
+#[Route(Http::GET, 'products')]      // → /mi-sitio/api/products   (JSON)
+#[Page(Http::GET, '')]               // → /mi-sitio/               (HTML)
+#[Page(Http::GET, 'productos/{id}')] // → /mi-sitio/productos/42   (HTML)
+```
+
+Así las URLs que indexan los buscadores quedan limpias sin tocar las del API.
+Dos reglas del router:
+
+- **Las rutas del API se registran primero**, y una página nunca atiende una
+  URL que caiga dentro de `BASE_PATH`. Un comodín como `#[Page(Http::GET, '{slug}')]`
+  no le puede ganar a un endpoint.
+- **Los errores siguen el tipo de URL.** Dentro de `BASE_PATH`, los 404 y 500
+  son JSON como siempre. Fuera de él, un 404 muestra `Views/errors/404.php`, y
+  una página que lanza una excepción muestra `Views/errors/500.php` (el detalle
+  va al log, nunca al HTML).
+
+Por eso, con `--web`, `BASE_PATH` tiene que ser un prefijo propio del API: no
+puede ser `/` ni coincidir con `WEB_BASE_PATH`. El generador lo comprueba.
+
+`#[Page]` está en todos los proyectos, pero solo tiene sentido con la capa de
+vistas: sin ella, los errores de cualquier URL siguen siendo JSON.
+
+#### Renderizar desde el controlador
+
+```php
+use App\Routing\{Http, Page};
+use App\Support\{Seo, View};
+use Symfony\Component\HttpFoundation\Response;
+
+#[Page(Http::GET, 'productos')]
+public function index(): Response
+{
+    return View::render('pages.products.index', [
+        'products' => $this->productService->findAll(),
+    ], new Seo(
+        title:       'Productos',
+        description: 'Catálogo completo de productos.',
+        keywords:    ['catálogo', 'productos'],
+        image:       'img/og-productos.jpg',
+    ));
+}
+```
+
+| | |
+|---|---|
+| `View::render($vista, $datos, $seo, layout: 'main', status: 200)` | Renderiza y envía la página |
+| `View::fetch($vista, $datos)` | Devuelve el HTML como cadena, sin layout: cuerpo de un correo, fragmento AJAX |
+| `View::error(403)` | Envía `Views/errors/403.php` con ese código y `noindex` |
+
+Las vistas se nombran con puntos: `'pages.products.index'` es
+`Views/pages/products/index.php`. Un nombre no puede salir de `Views/`: solo
+admite letras, números, guion y guion bajo por segmento.
+
+La vista se renderiza entera en memoria antes de enviar nada. Si falla a mitad,
+el navegador recibe la página 500, no medio documento.
+
+#### `App\Support\Seo`
+
+Todos los parámetros son opcionales y se pasan por nombre:
+
+| Parámetro | Etiquetas | Si no se indica |
+|---|---|---|
+| `title` | `<title>`, `og:title`, `twitter:title` — como «Título \| APP_NAME» | solo `APP_NAME` |
+| `description` | `description`, `og:description`, `twitter:description` | `SEO_DEFAULT_DESCRIPTION` |
+| `keywords` | `keywords` — lista o cadena | se omite |
+| `canonical` | `<link rel="canonical">`, `og:url` | la URL actual sin query string |
+| `robots` | `robots` | `index, follow` |
+| `image` | `og:image`, `twitter:image` — ruta dentro de `Public/` o URL absoluta | `SEO_DEFAULT_IMAGE` |
+| `type` | `og:type` | `website` |
+| `locale` | `og:locale`, `<html lang>` | `APP_LOCALE` |
+| `jsonLd` | `<script type="application/ld+json">` — un schema o una lista | se omite |
+| `meta` | Meta tags extra: `['author' => 'Flameware']` | |
+
+Todo se escapa. Las etiquetas sin valor no se imprimen vacías, el canonical y
+las imágenes salen como URL absoluta (Open Graph lo exige), y una página con
+`noindex` no declara canonical.
+
+#### Dentro de una vista
+
+Las vistas son PHP plano y `$this` es un `App\Support\Template`. Cada clave del
+array de datos llega como variable:
+
+```php
+<?php /** @var \App\Support\Template $this */ ?>
+<h1><?= $this->e($title) ?></h1>
+
+<?php foreach ($products as $product): ?>
+    <?= $this->component('product-card', ['product' => $product]) ?>
+<?php endforeach ?>
+
+<a href="<?= $this->url('contacto') ?>">Contáctanos</a>
+```
+
+| | |
+|---|---|
+| `$this->e($valor)` | Escapa un valor para HTML. **Todo dato propio se imprime con él** |
+| `$this->component('card', $props)` | Renderiza `Views/components/card.php` |
+| `$this->url('contacto')` | `/mi-sitio/contacto`, escapada para un atributo |
+| `$this->asset('css/app.css')` | `/mi-sitio/Public/css/app.css?v=…`, escapada y versionada |
+| `$this->start('scripts')` … `$this->end()` | Envía lo impreso entre ambos a una sección |
+| `$this->section('scripts')` | Imprime una sección en el layout |
+| `$this->layout('admin')` | Cambia el layout desde la propia vista |
+| `$this->content()` | En el layout: el HTML de la vista |
+| `$this->seo()` | En el layout: todas las etiquetas SEO del `<head>` |
+| `$this->seo->lang()` | En el layout: idioma para `<html lang>` |
+
+Lo que devuelven `component()`, `section()`, `content()` y `seo()` ya es HTML, y
+lo de `url()` y `asset()` ya viene escapado, así que se imprime tal cual. Solo
+`e()` es responsabilidad de quien escribe la vista.
+
+**Componentes.** Viven en `Views/components/` y tienen su propio ámbito: solo
+ven las props que reciben, nunca las variables de la vista que los llama. Así
+un componente se puede usar en cualquier página sin depender de cómo se llamen
+sus variables.
+
+**Secciones.** Sirven para que una página agregue CSS o JS propio al layout.
+Si varias vistas o componentes escriben en la misma sección, el contenido se
+acumula. Una sección abierta sin `end()` es un error, y se reporta con su nombre
+y el de la vista.
+
+```php
+<?php $this->start('scripts') ?>
+<script src="<?= $this->asset('js/galeria.js') ?>"></script>
+<?php $this->end() ?>
+```
+
+**`asset()` versiona los archivos.** Agrega `?v=` con la fecha de modificación,
+así el navegador los puede cachear indefinidamente y aun así recibe la versión
+nueva tras cada cambio.
+
+#### Generar una vista
+
+```bash
+flameware make:view pages.contacto
+```
+
+El primer segmento del nombre elige la plantilla:
+
+| Nombre | Archivo | Plantilla |
+|---|---|---|
+| `pages.contacto` | `Views/pages/contacto.php` | Página, e imprime el método del controlador listo para pegar |
+| `pages.blog.index` | `Views/pages/blog/index.php` | Página en la ruta `blog` |
+| `components.product-card` | `Views/components/product-card.php` | Componente con sus props |
+| `layouts.admin` | `Views/layouts/admin.php` | Documento HTML completo |
+| `errors.403` | `Views/errors/403.php` | Página para `View::error(403)` |
+| `emails.bienvenida` | `Views/emails/bienvenida.php` | Fragmento para `View::fetch()` |
+
+`--force` sobrescribe y `--project=<dir>` apunta a otro proyecto. El comando
+falla si el proyecto no tiene la capa de vistas.
+
+#### Variables de la capa de vistas
+
+`--web` agrega a `.env.local`:
+
+| Variable | Uso |
+|---|---|
+| `WEB_BASE_PATH` | Prefijo de las rutas `#[Page]` y de `Public/`. Por defecto, el `RewriteBase` |
+| `APP_NAME` | Sufijo del `<title>` y `og:site_name` |
+| `APP_URL` | Esquema y dominio públicos, sin ruta: `https://midominio.com` |
+| `APP_LOCALE` | `<html lang>` y `og:locale`, por ejemplo `es_CR` |
+| `SEO_DEFAULT_DESCRIPTION` | Descripción de las páginas que no declaren la suya |
+| `SEO_DEFAULT_IMAGE` | Imagen Open Graph de las páginas que no declaren la suya |
+
+**En producción, define `APP_URL`.** Si está vacía, el canonical y las URLs de
+Open Graph se construyen con el `Host` de la petición, que lo controla el
+cliente. Eso sirve en desarrollo, pero un canonical no debe depender de él.
+
+#### Seguridad
+
+Las plantillas de `Views/` son PHP ejecutable. Si se pudieran pedir por URL,
+Apache las ejecutaría fuera del framework. El `.htaccess` de un proyecto `--web`
+las bloquea con `RedirectMatch 404 /Views/`, igual que `Storage/`, y
+`composer.json` las excluye del classmap junto con `Public/`.
+
 ### Variables de entorno
 
 Cada clave de `.env.local` queda disponible como constante global — agregar una
@@ -715,9 +935,19 @@ $client = new StripeClient(STRIPE_KEY);
 El skeleton es un directorio de archivos reales, no plantillas embebidas: para
 cambiar lo que reciben los proyectos nuevos, edita `skeleton/` directamente.
 
+`skeleton-web/` es la capa de vistas. Con `--web` se copia encima de
+`skeleton/`, así que sus archivos se suman a los del skeleton y nunca deben
+repetir uno de ellos. Lo que tienen que tener todos los proyectos, como
+`Routing/Page.php` o el soporte de errores HTML del router, va en `skeleton/`.
+
 Los archivos `*.stub` son los que llevan placeholders (`{{PROJECT_NAME}}`,
-`{{BASE_PATH}}`, `{{REWRITE_BASE}}`, `{{DB_NAME}}`, `{{VENDOR}}`) y se renombran
-al generar — el mapa está en `Cli::materializeStubs()`.
+`{{BASE_PATH}}`, `{{REWRITE_BASE}}`, `{{DB_NAME}}`, `{{VENDOR}}`,
+`{{WEB_BASE_PATH}}`, `{{APP_NAME}}`) y se renombran al generar. Los de
+`skeleton-web/` (`env.web.stub` y `htaccess.web.stub`) no se renombran: se
+agregan al final de `.env.local` y `.htaccess`. El mapa de ambos está en
+`Cli::materializeStubs()`.
+
+Las plantillas de `make:view` están en `lib/ViewGenerator.php`.
 
 ## Requisitos
 

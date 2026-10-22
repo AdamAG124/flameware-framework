@@ -2,6 +2,7 @@
 
 use App\Config\{Config, Dependencies};
 use App\Routing\Router;
+use App\Support\View;
 use DI\ContainerBuilder;
 
 require_once __DIR__ . '/vendor/autoload.php';
@@ -31,7 +32,16 @@ class ApiGateWay
         $builder->addDefinitions((new Dependencies())->interfaceMap());
         $container = $builder->build();
 
-        $this->router->loadFromArray(require __DIR__ . '/Storage/route-cache.php', $container, BASE_PATH);
+        // WEB_BASE_PATH solo existe en proyectos con vistas (flameware new --web)
+        $webBasePath = defined('WEB_BASE_PATH') ? WEB_BASE_PATH : '/';
+
+        $this->router->loadFromArray(require __DIR__ . '/Storage/route-cache.php', $container, BASE_PATH, $webBasePath);
+
+        // Con vistas, los 404/500 fuera del API se muestran como página HTML
+        if (class_exists(View::class)) {
+            $this->router->setWebErrorHandler(static fn (int $status) => View::error($status));
+        }
+
         $this->router->dispatch($_SERVER['REQUEST_URI'], $_SERVER['REQUEST_METHOD']);
     }
 

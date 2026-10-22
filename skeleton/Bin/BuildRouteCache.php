@@ -30,4 +30,6 @@ $php    = "<?php\n// Generado por Bin/BuildRouteCache.php — no editar manualme
 file_put_contents($outFile, $php);
 
 $count = count($routes);
-echo "Caché de rutas construido: {$count} ruta(s) → Storage/route-cache.php\n";
+$pages = count(array_filter($routes, static fn (array $route): bool => $route[4] === 'web'));
+$detail = $pages > 0 ? " ({$pages} página(s) web)" : '';
+echo "Caché de rutas construido: {$count} ruta(s){$detail} → Storage/route-cache.php\n";

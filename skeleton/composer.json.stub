@@ -19,7 +19,9 @@
             "App\\": ""
         },
         "exclude-from-classmap": [
-            "Storage/"
+            "Storage/",
+            "Views/",
+            "Public/"
         ]
     },
     "scripts": {

@@ -42,11 +42,13 @@ class ControllerDiscovery
                 $rc = new ReflectionClass($fqcn);
 
                 foreach ($rc->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
-                    $attrs = $method->getAttributes(Route::class);
-                    foreach ($attrs as $attr) {
-                        /** @var Route $route */
-                        $route    = $attr->newInstance();
-                        $routes[] = [$route->method->value, $route->path, $fqcn, $method->getName()];
+                    // #[Route] cuelga de BASE_PATH (API) y #[Page] de WEB_BASE_PATH (vistas)
+                    foreach ([Route::class => 'api', Page::class => 'web'] as $attribute => $scope) {
+                        foreach ($method->getAttributes($attribute) as $attr) {
+                            /** @var Route|Page $route */
+                            $route    = $attr->newInstance();
+                            $routes[] = [$route->method->value, $route->path, $fqcn, $method->getName(), $scope];
+                        }
                     }
                 }
             } catch (\Throwable) {

@@ -11,5 +11,6 @@ RewriteRule ^ index.php [L]
     Require all denied
 </FilesMatch>
 
-# Storage no debe servirse por HTTP.
-RedirectMatch 404 ^/.*/Storage/.*$
+# Storage no debe servirse por HTTP. Sin anclar al inicio para que también
+# cubra los proyectos servidos desde la raíz del dominio (/Storage/...).
+RedirectMatch 404 /Storage/

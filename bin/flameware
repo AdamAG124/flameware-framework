@@ -8,9 +8,11 @@ declare(strict_types=1);
  *
  * Uso:
  *   flameware new <nombre> [opciones]
+ *   flameware make:resource <Nombre> [opciones]
+ *   flameware make:view <vista> [opciones]
  */
 
-const FLAMEWARE_VERSION = '1.4.0';
+const FLAMEWARE_VERSION = '1.5.0';
 const FLAMEWARE_MIN_PHP = 80500;
 
 /*
@@ -35,16 +37,21 @@ require_once dirname(__DIR__) . '/lib/ModelReader.php';
 require_once dirname(__DIR__) . '/lib/FieldParser.php';
 require_once dirname(__DIR__) . '/lib/SchemaReader.php';
 require_once dirname(__DIR__) . '/lib/ResourceGenerator.php';
+require_once dirname(__DIR__) . '/lib/ViewGenerator.php';
 
 final class Cli
 {
     private string $skeleton;
 
+    /** Capa de vistas: se copia encima del skeleton solo con --web. */
+    private string $skeletonWeb;
+
     public function __construct()
     {
         // __DIR__ ya viene con los symlinks resueltos, así que esto funciona
         // aunque el binario se invoque desde ~/.local/bin/flameware.
-        $this->skeleton = dirname(__DIR__) . '/skeleton';
+        $this->skeleton    = dirname(__DIR__) . '/skeleton';
+        $this->skeletonWeb = dirname(__DIR__) . '/skeleton-web';
     }
 
     public function run(array $argv): int
@@ -54,6 +61,7 @@ final class Cli
         return match ($command) {
             'new'                 => $this->commandNew(array_slice($argv, 2)),
             'make:resource'       => $this->commandMakeResource(array_slice($argv, 2)),
+            'make:view'           => $this->commandMakeView(array_slice($argv, 2)),
             '--version', '-V'     => $this->commandVersion(),
             'help', '--help', '-h', null => $this->commandHelp(),
             default => $this->fail("Comando desconocido: {$command}\nEjecuta «flameware help» para ver el uso."),
@@ -94,19 +102,39 @@ final class Cli
         $slug        = $this->slugify($name);
         $basePath    = $options['base-path'] ?? "/{$name}/api/";
         $rewriteBase = $options['rewrite-base'] ?? $this->deriveRewriteBase($basePath, $name);
+        $web         = isset($options['web']);
+
+        if ($web) {
+            if (!is_dir($this->skeletonWeb)) {
+                return $this->fail("No se encontró la capa de vistas en {$this->skeletonWeb}");
+            }
+
+            $conflict = $this->webPathConflict($basePath, $rewriteBase);
+
+            if ($conflict !== null) {
+                return $this->fail($conflict);
+            }
+        }
 
         $replacements = [
-            '{{PROJECT_NAME}}' => $slug,
-            '{{VENDOR}}'       => $options['vendor'] ?? 'app',
-            '{{BASE_PATH}}'    => $basePath,
-            '{{REWRITE_BASE}}' => $rewriteBase,
-            '{{DB_NAME}}'      => $options['db'] ?? '',
+            '{{PROJECT_NAME}}'  => $slug,
+            '{{VENDOR}}'        => $options['vendor'] ?? 'app',
+            '{{BASE_PATH}}'     => $basePath,
+            '{{REWRITE_BASE}}'  => $rewriteBase,
+            '{{DB_NAME}}'       => $options['db'] ?? '',
+            '{{WEB_BASE_PATH}}' => $rewriteBase,
+            '{{APP_NAME}}'      => $this->dotenvQuoted($options['app-name'] ?? $this->humanize($name)),
         ];
 
         $this->banner($name);
 
         $this->step('Copiando estructura del proyecto');
         $this->copyTree($this->skeleton, $target);
+
+        if ($web) {
+            $this->step('Agregando la capa de vistas (--web)');
+            $this->copyTree($this->skeletonWeb, $target);
+        }
 
         $this->step('Aplicando plantillas');
         $this->materializeStubs($target, $replacements);
@@ -117,7 +145,7 @@ final class Cli
             if (!$this->composerInstall($target)) {
                 $this->warn('composer install falló. El proyecto quedó creado; ejecútalo a mano:');
                 $this->warn("  cd {$target} && composer install");
-                $this->nextSteps($name, $target, $basePath, installed: false);
+                $this->nextSteps($name, $target, $basePath, installed: false, webBasePath: $web ? $rewriteBase : null);
                 return 1;
             }
         } else {
@@ -129,7 +157,7 @@ final class Cli
             $this->gitInit($target);
         }
 
-        $this->nextSteps($name, $target, $basePath, installed: !isset($options['no-install']));
+        $this->nextSteps($name, $target, $basePath, installed: !isset($options['no-install']), webBasePath: $web ? $rewriteBase : null);
 
         return 0;
     }
@@ -196,6 +224,48 @@ final class Cli
 
         echo "\n  \033[32m✓\033[0m Recurso \033[1m{$resource}\033[0m generado.\n";
         echo "    \033[2mRevisa las reglas #[Assert] del RequestDto y los nombres de columna del EloquentModel.\033[0m\n\n";
+
+        return 0;
+    }
+
+    private function commandMakeView(array $args): int
+    {
+        [$options, $positional] = $this->parseArgs($args);
+
+        $view = $positional[0] ?? null;
+
+        if ($view === null) {
+            return $this->fail('Falta el nombre de la vista.  Uso: flameware make:view <vista>, por ejemplo «pages.contacto»');
+        }
+
+        $project = $options['project'] ?? getcwd();
+
+        if (!is_file($project . '/composer.json') || !is_dir($project . '/Config')) {
+            return $this->fail("No parece un proyecto Flameware: {$project}\n    Ejecuta el comando dentro del proyecto o pasa --project=<dir>.");
+        }
+
+        if (!is_dir($project . '/Views') || !is_file($project . '/Support/View.php')) {
+            return $this->fail("Este proyecto no tiene la capa de vistas.\n    Los proyectos con vistas se crean con «flameware new <nombre> --web».");
+        }
+
+        try {
+            $generator = new ViewGenerator($project, $view);
+            $relative  = $generator->generate(isset($options['force']));
+        } catch (RuntimeException $e) {
+            return $this->fail($e->getMessage());
+        }
+
+        echo "\n    \033[32m+\033[0m {$relative}\n";
+
+        $snippet = $generator->controllerSnippet();
+
+        if ($snippet !== null) {
+            echo "\n  \033[2mPara servirla, agrega este método a un controlador y ejecuta\033[0m \033[36mcomposer routes\033[0m\033[2m:\033[0m\n\n";
+            echo preg_replace('/^/m', '    ', $snippet) . "\n";
+            echo "\n  \033[2mImports: App\\Routing\\{Http, Page}, App\\Support\\{Seo, View}, Symfony\\Component\\HttpFoundation\\Response\033[0m\n";
+        }
+
+        echo "\n";
 
         return 0;
     }
@@ -375,6 +445,8 @@ final class Cli
             {$c}--rewrite-base=<ruta>{$r}  RewriteBase del .htaccess {$d}(derivado de --base-path){$r}
             {$c}--db=<nombre>{$r}          Base de datos de Eloquent {$d}(vacío = sin base de datos){$r}
             {$c}--vendor=<nombre>{$r}      Vendor del composer.json {$d}(por defecto: app){$r}
+            {$c}--web{$r}                  Agrega la capa de vistas: View, Seo, Views/ y Public/
+            {$c}--app-name=<nombre>{$r}    Nombre del sitio para el <title> {$d}(con --web; por defecto: el del proyecto){$r}
             {$c}--no-install{$r}           No ejecutar composer install
             {$c}--no-git{$r}               No inicializar el repositorio git
 
@@ -387,6 +459,9 @@ final class Cli
 
             {$d}# API en la raíz del dominio{$r}
             flameware new checkout --base-path=/ --rewrite-base=/
+
+            {$d}# sitio con vistas: páginas en /mi-sitio/ y API en /mi-sitio/api/{$r}
+            flameware new mi-sitio --web --app-name="Mi Sitio"
 
           {$b}DENTRO DE UN PROYECTO{$r}
             {$c}flameware make:resource <Nombre>{$r} [opciones]
@@ -411,7 +486,18 @@ final class Cli
               {$d}# con una referencia a un recurso ya generado{$r}
               flameware make:resource Client --fields="clientId:int,personId:Person"
 
-            {$c}composer routes{$r}        Reconstruye el caché de rutas tras agregar un #[Route]
+            {$c}flameware make:view <vista>{$r} [opciones]
+                Crea el archivo de una vista en un proyecto --web. El primer segmento
+                decide la plantilla: pages, components, layouts, errors o un fragmento.
+                Para una página imprime además el método del controlador.
+
+              {$c}--force{$r}               Sobrescribe la vista si ya existe
+              {$c}--project=<dir>{$r}       Proyecto destino {$d}(por defecto: el actual){$r}
+
+              flameware make:view pages.contacto
+              flameware make:view components.product-card
+
+            {$c}composer routes{$r}        Reconstruye el caché de rutas tras agregar un #[Route] o #[Page]
 
 
         HELP;
@@ -421,9 +507,15 @@ final class Cli
 
     // ------------------------------------------------------------ generación
 
+    /**
+     * Copia un árbol de archivos. Admite un destino que ya existe: así la capa
+     * de vistas se copia encima del skeleton.
+     */
     private function copyTree(string $source, string $target): void
     {
-        mkdir($target, 0755, true);
+        if (!is_dir($target)) {
+            mkdir($target, 0755, true);
+        }
 
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($source, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -434,7 +526,9 @@ final class Cli
             $destination = $target . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
 
             if ($item->isDir()) {
-                mkdir($destination, 0755, true);
+                if (!is_dir($destination)) {
+                    mkdir($destination, 0755, true);
+                }
                 continue;
             }
 
@@ -465,6 +559,26 @@ final class Cli
             $contents = strtr((string) file_get_contents($path), $replacements);
 
             file_put_contents($target . '/' . $final, $contents);
+            unlink($path);
+        }
+
+        // Fragmentos de la capa de vistas: se agregan al final del archivo ya
+        // generado. Solo existen en el proyecto si se copió con --web.
+        $appends = [
+            'env.web.stub'      => '.env.local',
+            'htaccess.web.stub' => '.htaccess',
+        ];
+
+        foreach ($appends as $stub => $final) {
+            $path = $target . '/' . $stub;
+
+            if (!is_file($path)) {
+                continue;
+            }
+
+            $contents = strtr((string) file_get_contents($path), $replacements);
+
+            file_put_contents($target . '/' . $final, $contents, FILE_APPEND);
             unlink($path);
         }
 
@@ -545,6 +659,44 @@ final class Cli
         return trim($slug, '-') ?: 'api';
     }
 
+    /** «mi-sitio» → «Mi Sitio», el nombre por defecto del sitio en el <title>. */
+    private function humanize(string $name): string
+    {
+        return ucwords(trim(str_replace(['-', '_', '.'], ' ', $name)));
+    }
+
+    /**
+     * Escapa un valor para ir entre comillas dobles en .env.local: phpdotenv
+     * interpreta \, \" y ${...} dentro de ellas.
+     */
+    private function dotenvQuoted(string $value): string
+    {
+        return strtr($value, ['\\' => '\\\\', '"' => '\\"', '$' => '\\$']);
+    }
+
+    /**
+     * El router decide si una URL es del API por el prefijo BASE_PATH, así que
+     * las páginas (WEB_BASE_PATH) no pueden compartirlo ni quedar dentro de él.
+     */
+    private function webPathConflict(string $basePath, string $webBasePath): ?string
+    {
+        $api  = rtrim($basePath, '/') . '/';
+        $site = rtrim($webBasePath, '/') . '/';
+
+        if ($api === '/') {
+            return "Con --web el API necesita su propio prefijo: --base-path no puede ser «/».\n"
+                . "    Para un sitio en la raíz del dominio: --base-path=/api/ --rewrite-base=/";
+        }
+
+        if (str_starts_with($site, $api)) {
+            return "Las páginas ({$site}) quedarían dentro del prefijo del API ({$api}) y el router\n"
+                . "    las trataría como endpoints. Usa un --base-path con su propio segmento,\n"
+                . "    por ejemplo --base-path={$site}api/";
+        }
+
+        return null;
+    }
+
     /**
      * BASE_PATH es el prefijo completo de las rutas (/mi-api/api/) mientras que
      * RewriteBase es la carpeta donde vive el front controller (/mi-api/).
@@ -593,7 +745,7 @@ final class Cli
         return 1;
     }
 
-    private function nextSteps(string $name, string $target, string $basePath, bool $installed): void
+    private function nextSteps(string $name, string $target, string $basePath, bool $installed, ?string $webBasePath = null): void
     {
         $b = "\033[1m";
         $c = "\033[36m";
@@ -610,8 +762,13 @@ final class Cli
 
         echo "    {$d}# revisa .env.local — credenciales de base de datos, SMTP y CORS{$r}\n\n";
         echo "  {$b}COMPROBACIÓN{$r}\n";
-        echo "    {$d}curl http://localhost{$basePath}health{$r}\n\n";
-        echo "  {$d}Al agregar un #[Route] nuevo, ejecuta{$r} {$c}composer routes{$r}\n\n";
+        echo "    {$d}curl http://localhost{$basePath}health{$r}\n";
+
+        if ($webBasePath !== null) {
+            echo "    {$d}abre http://localhost{$webBasePath} en el navegador{$r}\n";
+        }
+
+        echo "\n  {$d}Al agregar un #[Route] o #[Page] nuevo, ejecuta{$r} {$c}composer routes{$r}\n\n";
     }
 }
 
